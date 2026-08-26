@@ -1,0 +1,23 @@
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+
+# 日志文件
+*.log
+purchase_log.txt
+
+# IDE 配置（根据您使用的 IDE 选择）
+.vscode/
+.idea/
+*.iml
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
