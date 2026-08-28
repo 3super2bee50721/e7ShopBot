@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 from PIL import ImageGrab
 import pyautogui
+import pygetwindow as gw
 from datetime import datetime
 
 
@@ -69,6 +70,28 @@ logging.basicConfig(
 
 # ---------- 辅助函数 ----------
 
+import pygetwindow as gw
+
+def get_game_window():
+    """
+    获取当前活动窗口作为游戏窗口。
+    返回 (left, top, width, height) 元组，若获取失败则返回全屏区域。
+    """
+    try:
+        active_win = gw.getActiveWindow()
+        if active_win is not None:
+            left, top, w, h = active_win.left, active_win.top, active_win.width, active_win.height
+            logging.info(f"活动窗口区域: left={left}, top={top}, width={w}, height={h}")
+            return (left, top, w, h)
+        else:
+            logging.warning("未获取到活动窗口，将使用全屏")
+    except Exception as e:
+        logging.error(f"获取活动窗口失败: {e}")
+
+    screen_w, screen_h = pyautogui.size()
+    return (0, 0, screen_w, screen_h)
+
+
 def check_buy_status(item_pos, confidence=0.75):
     """
     检测道具的购买状态
@@ -112,22 +135,43 @@ def check_buy_status(item_pos, confidence=0.75):
     else:
         return None
 
-def check_text_in_region(item_pos, text_key, confidence=0.8):
+def check_text_in_region(item_pos, text_key, region=None, confidence=0.8):
     """
-    在道具左上角向右300像素的矩形区域内验证文字
-    item_pos: (x,y,w,h)
+    在道具左上角向右 30% 的窗口宽度、高度与道具相同的矩形区域内验证文字
+    item_pos: (x,y,w,h) 相对于 region 的坐标
+    region: (left, top, width, height) 或 None（全屏）
     """
     x, y, w, h = item_pos
-    # 文字区域：从左上角开始，宽度300，高度=h
-    region_rect = (x, y, 300, h)
-    screen = capture_screen(None)
+
+    # 获取窗口宽度
+    if region is not None:
+        win_width = region[2]
+    else:
+        win_width = pyautogui.size().width
+
+    # 文字区域宽度为窗口宽度的 30%
+    text_width = int(win_width * 0.30)
+    region_rect = (x, y, text_width, h)
+
+    screen = capture_screen(region)  # 截取 region 区域（若 None 则全屏）
     template = TEMPLATES.get(text_key)
     if template is None:
         return False
+
     x0, y0, w0, h0 = region_rect
+    img_h, img_w = screen.shape
+    # 确保不超出截图区域
+    x0 = max(0, min(x0, img_w - 1))
+    y0 = max(0, min(y0, img_h - 1))
+    w0 = min(w0, img_w - x0)
+    h0 = min(h0, img_h - y0)
+    if w0 <= 0 or h0 <= 0:
+        return False
+
     roi = screen[y0:y0+h0, x0:x0+w0]
     if roi.shape[0] < template.shape[0] or roi.shape[1] < template.shape[1]:
         return False
+
     result = cv2.matchTemplate(roi, template, cv2.TM_CCOEFF_NORMED)
     min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
     return max_val >= confidence
@@ -139,8 +183,24 @@ def random_delay(category):
         time.sleep(random.uniform(min_t, max_t))
 
 def capture_screen(region=None):
-    screenshot = ImageGrab.grab(bbox=region) if region else ImageGrab.grab()
+    """
+    截取屏幕指定区域。region 格式为 (left, top, width, height)，
+    内部自动转换为 bbox (left, top, left+width, top+height)。
+    """
+    if region is not None:
+        left, top, width, height = region
+        # 确保宽高为正
+        if width <= 0 or height <= 0:
+            logging.error(f"无效的截图区域: {region}")
+            region = None
+        else:
+            bbox = (left, top, left + width, top + height)
+    else:
+        bbox = None
+
+    screenshot = ImageGrab.grab(bbox=bbox)
     return cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2GRAY)
+
 
 def find_template_in_region(image_gray, template, region_rect):
     if template is None:
@@ -174,42 +234,99 @@ def find_all_item_positions(item_key, region=None):
 def click_buy_for_item(item_pos, item_type, region=None):
     x, y, w, h = item_pos
 
-    # ---- 1. 文字验证 ----
-    text_key = "bookmark_text" if item_type == "bookmark" else "medal_text"
-    if not check_text_in_region(item_pos, text_key):
-        logging.warning(f"道具 ({x},{y}) 文字验证失败，跳过")
+    # ---- 1. 文字验证（可选，可保留或注释） ----
+    # text_key = "bookmark_text" if item_type == "bookmark" else "medal_text"
+    # if not check_text_in_region(item_pos, text_key):
+    #     logging.warning(f"道具 ({x},{y}) 文字验证失败，跳过")
+    #     return False
+
+    # ---- 2. 计算搜索区域（相对于 region 或全屏） ----
+    if region is not None:
+        reg_left, reg_top, reg_width, reg_height = region
+    else:
+        reg_left, reg_top, reg_width, reg_height = 0, 0, pyautogui.size().width, pyautogui.size().height
+
+    start_ratio = 0.28
+    end_ratio = 0.46
+    search_x_offset = int(reg_width * start_ratio)
+    search_w = int(reg_width * (end_ratio - start_ratio))
+    search_x = x + search_x_offset
+    search_y = y
+    search_h = h
+
+    if region is not None:
+        max_x = reg_left + reg_width
+        max_y = reg_top + reg_height
+        search_x = max(reg_left, min(search_x, max_x - 1))
+        search_y = max(reg_top, min(search_y, max_y - 1))
+        search_w = min(search_w, max_x - search_x)
+        search_h = min(search_h, max_y - search_y)
+    else:
+        screen_w, screen_h = pyautogui.size()
+        search_x = max(0, min(search_x, screen_w - 1))
+        search_y = max(0, min(search_y, screen_h - 1))
+        search_w = min(search_w, screen_w - search_x)
+        search_h = min(search_h, screen_h - search_y)
+
+    if search_w <= 0 or search_h <= 0:
+        logging.warning(f"道具 ({x},{y}) 搜索区域无效，跳过")
         return False
 
-    # ---- 2. 购买状态检测 ----
-    status = check_buy_status(item_pos)
-    if status == 'unavailable':
+    screen_roi = capture_screen(region)
+    roi = screen_roi[search_y:search_y+search_h, search_x:search_x+search_w]
+    if roi.shape[0] == 0 or roi.shape[1] == 0:
+        logging.warning(f"道具 ({x},{y}) ROI 为空")
+        return False
+
+    available_template = TEMPLATES.get("available")
+    unavailable_template = TEMPLATES.get("unavailable")
+    if available_template is None or unavailable_template is None:
+        logging.warning("状态模板未加载")
+        return False
+
+    res_avail = cv2.matchTemplate(roi, available_template, cv2.TM_CCOEFF_NORMED)
+    _, max_avail, _, max_loc_avail = cv2.minMaxLoc(res_avail)
+    res_unavail = cv2.matchTemplate(roi, unavailable_template, cv2.TM_CCOEFF_NORMED)
+    _, max_unavail, _, _ = cv2.minMaxLoc(res_unavail)
+
+    logging.debug(f"1/1匹配值: {max_avail:.3f}, 0/1匹配值: {max_unavail:.3f}")
+
+    confidence_status = 0.75
+
+    if max_avail >= confidence_status and max_avail > max_unavail:
+        h_avail, w_avail = available_template.shape
+        click_x_rel = search_x + max_loc_avail[0] + w_avail // 2
+        click_y_rel = search_y + max_loc_avail[1] + h_avail // 2
+
+        if region is not None:
+            click_abs_x = reg_left + click_x_rel
+            click_abs_y = reg_top + click_y_rel
+        else:
+            click_abs_x = click_x_rel
+            click_abs_y = click_y_rel
+
+        logging.info(f"点击 '1/1' 按钮: ({click_abs_x}, {click_abs_y})")
+
+        time.sleep(3)
+        pyautogui.moveTo(click_abs_x + random.randint(-3, 3),
+                         click_abs_y + random.randint(-3, 3),
+                         duration=random.uniform(0.05, 0.15))
+        pyautogui.click()
+        random_delay("click")
+
+        # ---------- 超时处理：停止程序 ----------
+        if not wait_and_click_template("confirm_buy", timeout=3.5, region=region):
+            logging.error("购买确认弹窗超时（3.5秒），停止程序")
+            global stop_flag
+            stop_flag = True
+            return False
+        return True
+
+    elif max_unavail >= confidence_status and max_unavail > max_avail:
         logging.info(f"道具 ({x},{y}) 状态为 0/1，已购买，跳过")
         return False
-    elif status != 'available':
-        # 如果未检测到明确状态，可尝试二次检测（等待0.5秒重试）
-        time.sleep(0.5)
-        status = check_buy_status(item_pos)
-        if status != 'available':
-            logging.warning(f"道具 ({x},{y}) 状态不确定，跳过")
-            return False
-
-    # ---- 3. 点击购买（坐标：左下角向右600像素） ----
-    click_x = x + 600 + random.randint(-5, 5)
-    click_y = y + h + random.randint(-5, 5)
-    screen_w, screen_h = pyautogui.size()
-    click_x = max(0, min(screen_w, click_x))
-    click_y = max(0, min(screen_h, click_y))
-
-    time.sleep(3)   # 购买前等待
-
-    pyautogui.moveTo(click_x, click_y, duration=random.uniform(0.05, 0.15))
-    pyautogui.click()
-    random_delay("click")
-
-    if wait_and_click_template("confirm_buy", timeout=3.5, region=region):
-        return True
     else:
-        logging.warning("购买确认弹窗未出现")
+        logging.warning(f"道具 ({x},{y}) 未检测到明确状态，跳过")
         return False
 
 def wait_and_click_template(template_name, timeout=3.5, region=None):
@@ -222,8 +339,13 @@ def wait_and_click_template(template_name, timeout=3.5, region=None):
             min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
             if max_val >= CONFIDENCE:
                 h, w = template.shape
-                center = (max_loc[0] + w//2, max_loc[1] + h//2)
-                pyautogui.moveTo(center[0] + random.randint(-3, 3), center[1] + random.randint(-3, 3), duration=random.uniform(0.05, 0.15))
+                center_x = max_loc[0] + w//2
+                center_y = max_loc[1] + h//2
+                if region is not None:
+                    left, top, _, _ = region
+                    center_x += left
+                    center_y += top
+                pyautogui.moveTo(center_x + random.randint(-3, 3), center_y + random.randint(-3, 3), duration=random.uniform(0.05, 0.15))
                 pyautogui.click()
                 random_delay("click")
                 return True
@@ -239,13 +361,17 @@ def click_template_direct(template_name, region=None):
     min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
     if max_val >= CONFIDENCE:
         h, w = template.shape
-        center = (max_loc[0] + w//2, max_loc[1] + h//2)
-        pyautogui.moveTo(center[0] + random.randint(-3, 3), center[1] + random.randint(-3, 3), duration=random.uniform(0.05, 0.15))
+        center_x = max_loc[0] + w//2
+        center_y = max_loc[1] + h//2
+        if region is not None:
+            left, top, _, _ = region
+            center_x += left
+            center_y += top
+        pyautogui.moveTo(center_x + random.randint(-3, 3), center_y + random.randint(-3, 3), duration=random.uniform(0.05, 0.15))
         pyautogui.click()
         random_delay("click")
         return True
     return False
-
 def scan_and_purchase(region=None):
     global bookmark_groups, medal_groups   # 修正变量名
     all_items = []
@@ -278,60 +404,110 @@ def scan_and_purchase(region=None):
 def automation_loop(max_refresh):
     global is_running, stop_flag, refresh_count
     logging.info("自动化线程启动")
-    time.sleep(3)   # 等待3秒，让您切换窗口
+    time.sleep(1)
 
-    # ----- 点击固定坐标 (1455, 700) 激活窗口 -----
-    pyautogui.click(1455, 700)
+    # --- 获取窗口区域 ---
+    try:
+        active_win = gw.getActiveWindow()
+        if active_win is not None:
+            left, top, w, h = active_win.left, active_win.top, active_win.width, active_win.height
+            logging.info(f"原始窗口区域: left={left}, top={top}, width={w}, height={h}")
+            offset_x = 8
+            offset_y = 30
+            adjusted_left = left + offset_x
+            adjusted_top = top + offset_y
+            adjusted_width = w - 2 * offset_x
+            adjusted_height = h - offset_y - offset_x
+            window_region = (adjusted_left, adjusted_top, adjusted_width, adjusted_height)
+            logging.info(f"调整后窗口区域: left={adjusted_left}, top={adjusted_top}, width={adjusted_width}, height={adjusted_height}")
+        else:
+            logging.warning("未获取到活动窗口，使用全屏")
+            screen_w, screen_h = pyautogui.size()
+            window_region = (0, 0, screen_w, screen_h)
+    except Exception as e:
+        logging.error(f"获取窗口失败: {e}")
+        screen_w, screen_h = pyautogui.size()
+        window_region = (0, 0, screen_w, screen_h)
+
+    left, top, win_w, win_h = window_region
+    logging.info(f"游戏窗口区域: left={left}, top={top}, width={win_w}, height={win_h}")
+
+    time.sleep(1)
+    click_x = left + int(win_w * 0.75)
+    click_y = top + int(win_h * 0.5)
+    pyautogui.click(click_x, click_y)
     time.sleep(0.5)
 
-    region = None  # 可自定义窗口区域
+    region = window_region
+    scroll_pixels = int(win_h * 0.25)
 
+    # ========== 程序启动初始扫描（相当于刚刷新后的完整扫描） ==========
+    logging.info("程序启动初始扫描（执行完整顶部+底部扫描）...")
+    logging.info("扫描当前可见区域（顶部）...")
+    scan_with_retry(scan_and_purchase, region, max_attempts=5, no_purchase_required=2, delay=0.3)
+
+    logging.info("连续下滑两次...")
+    for _ in range(2):
+        pyautogui.scroll(-scroll_pixels)
+        time.sleep(random.uniform(0.3, 0.4))
+
+    logging.info("扫描当前可见区域（底部）...")
+    scan_with_retry(scan_and_purchase, region, max_attempts=5, no_purchase_required=2, delay=0.3)
+    logging.info("初始扫描完成，进入主循环。")
+
+    # ---------- 主循环 ----------
     while is_running and not stop_flag and refresh_count < max_refresh:
         try:
-            # ----- 先扫描当前商店，尝试购买 -----
-            logging.info("扫描当前可见区域...")
-            purchased = scan_and_purchase(region)
-            # 向下滚动一次
-            pyautogui.scroll(-SCROLL_AMOUNT)
-            time.sleep(0.5)
-            logging.info("扫描滚动后的区域...")
-            purchased2 = scan_and_purchase(region)
-            # 如果购买到了任何道具，则本轮结束（不刷新）
-            if purchased or purchased2:
-                logging.info("本轮已购买道具，跳过刷新")
-                random_delay("between_loop")
-                continue
+            # ========== 刷新前检测（只扫描当前可见区域，此时页面在底部） ==========
+            logging.info("扫描当前可见区域（刷新前检测）...")
+            cleared = scan_with_retry(scan_and_purchase, region, max_attempts=5, no_purchase_required=2, delay=0.3)
+            if cleared:
+                logging.info("当前区域已清空（无更多可购买道具）")
+            else:
+                logging.warning("扫描达到尝试上限，但视为清空，继续执行")
 
-            # ----- 没有可购买道具，执行刷新 -----
-            logging.info("未检测到可购买道具，执行刷新...")
-            if not click_template_direct("refresh_btn", region):
-                logging.warning("未找到刷新按钮")
-                time.sleep(2)
-                continue
-            # 刷新确认前延迟0.5秒
+            # ========== 执行刷新 ==========
+            logging.info("未检测到可购买道具（或已全部购买），执行刷新...")
+            refresh_x = left + int(win_w * 0.16)
+            refresh_y = top + win_h - int(win_h * 0.07)
+            refresh_x = max(left, min(left + win_w, refresh_x))
+            refresh_y = max(top, min(top + win_h, refresh_y))
+            logging.info(f"点击刷新按钮: ({refresh_x}, {refresh_y})")
+            pyautogui.click(refresh_x, refresh_y)
             time.sleep(0.5)
+
+            # ---------- 超时处理：停止程序 ----------
             if not wait_and_click_template("confirm_refresh", timeout=12.0, region=region):
-                logging.warning("刷新确认弹窗未出现")
-                time.sleep(2)
-                continue
+                logging.error("刷新确认弹窗超时（12秒），停止程序")
+                stop_flag = True
+                break
 
             refresh_count += 1
             logging.info(f"刷新成功 (第{refresh_count}次)")
 
-            # 刷新后等待加载（增加额外0.75秒）
-            time.sleep(random.uniform(2.0, 3.0) + 0.75)
+            # 刷新后等待加载
+            time.sleep(random.uniform(2.5, 3.0) + 1.0)
+            # ---------- 超时处理：停止程序 ----------
+            if not wait_for_loading(region):
+                logging.error("刷新后加载超时（15秒），停止程序")
+                stop_flag = True
+                break
 
-            # 点击固定坐标 (1455,700)
-            pyautogui.click(1455, 700)
+            # 激活窗口
+            pyautogui.click(left + int(win_w * 0.75), top + int(win_h * 0.5))
             time.sleep(0.5)
 
-            # 扫描刷新后的商店（同样两次）
-            logging.info("扫描当前可见区域...")
-            scan_and_purchase(region)
-            pyautogui.scroll(-SCROLL_AMOUNT)
-            time.sleep(0.5)
-            logging.info("扫描滚动后的区域...")
-            scan_and_purchase(region)
+            # ========== 刷新后扫描（顶部 + 底部） ==========
+            logging.info("扫描当前可见区域（顶部）...")
+            scan_with_retry(scan_and_purchase, region, max_attempts=5, no_purchase_required=2, delay=0.3)
+
+            logging.info("连续下滑两次...")
+            for _ in range(2):
+                pyautogui.scroll(-scroll_pixels)
+                time.sleep(random.uniform(0.3, 0.4))
+
+            logging.info("扫描当前可见区域（底部）...")
+            scan_with_retry(scan_and_purchase, region, max_attempts=5, no_purchase_required=2, delay=0.3)
 
             random_delay("between_loop")
 
@@ -342,8 +518,62 @@ def automation_loop(max_refresh):
     if refresh_count >= max_refresh:
         logging.info("达到最大刷新次数，自动停止")
     elif stop_flag:
-        logging.info("用户手动停止")
+        logging.info("用户手动停止或发生错误")
     is_running = False
+
+
+def scan_with_retry(scan_func, region, max_attempts=5, no_purchase_required=2, delay=0.5):
+    """
+    执行扫描购买，直到连续 no_purchase_required 次没有购买到任何道具，
+    或达到最大尝试次数 max_attempts。
+    返回 True 表示区域已清空（连续无道具），False 表示达到尝试上限但仍有道具（保守）。
+    """
+    no_purchase_count = 0
+    attempts = 0
+    while attempts < max_attempts and no_purchase_count < no_purchase_required:
+        purchased = scan_func(region)
+        attempts += 1
+        if purchased:
+            no_purchase_count = 0
+            logging.info(f"第 {attempts} 次扫描购买到道具，继续扫描...")
+            time.sleep(delay)  # 购买后等待，让界面更新
+        else:
+            no_purchase_count += 1
+            if no_purchase_count < no_purchase_required:
+                logging.info(f"第 {attempts} 次扫描未发现道具，{delay}秒后重扫...")
+                time.sleep(delay)
+    if no_purchase_count >= no_purchase_required:
+        logging.info(f"连续 {no_purchase_required} 次扫描无道具，区域已清空")
+        return True
+    else:
+        logging.info(f"达到最大尝试次数 {max_attempts}，停止扫描")
+        return False
+
+def is_template_present(template_name, region=None, confidence=CONFIDENCE):
+    """检测指定模板是否在当前截图区域内出现（不执行点击）"""
+    screen = capture_screen(region)
+    template = TEMPLATES.get(template_name)
+    if template is None:
+        return False
+    result = cv2.matchTemplate(screen, template, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, _ = cv2.minMaxLoc(result)
+    return max_val >= confidence
+
+def wait_for_loading(region, timeout=15, check_interval=0.5):
+    """
+    等待商店加载完成（通过检测刷新按钮是否可识别）
+    timeout: 最大等待时间（秒）
+    check_interval: 检测间隔
+    返回 True 表示加载完成，False 表示超时
+    """
+    start = time.time()
+    while time.time() - start < timeout:
+        if is_template_present("refresh_btn", region):
+            logging.info("加载完成：检测到刷新按钮")
+            return True
+        time.sleep(check_interval)
+    logging.warning("加载超时，继续执行")
+    return False
 
 # ---------- GUI 应用程序 ----------
 class AutoShopApp:
@@ -431,8 +661,8 @@ class AutoShopApp:
         self.medal_var.set(str(medal_groups))
 
         if refresh_count > 0:
-            bk_prob = (bookmark_groups / refresh_count) / 6 * 100
-            med_prob = (medal_groups / refresh_count) / 6 * 100
+            bk_prob = (bookmark_groups / refresh_count) * 100
+            med_prob = (medal_groups / refresh_count) * 100
             self.bookmark_prob_var.set(f"{bk_prob:.2f}%")
             self.medal_prob_var.set(f"{med_prob:.2f}%")
         else:
@@ -473,12 +703,13 @@ class AutoShopApp:
             messagebox.showerror("错误", "请输入有效的数字")
             return
 
+        # 提示用户将游戏窗口置于最前
+        messagebox.showinfo("提示", "点击“确定”后点一下游戏窗口。")
+
         stop_flag = False
         is_running = True
-        # UI状态会在定时刷新中自动更新，无需手动调用
 
         try:
-            # 启动自动化线程，不传递任何回调
             self.thread = threading.Thread(target=automation_loop, args=(max_ref,), daemon=True)
             self.thread.start()
         except Exception as e:
@@ -486,7 +717,7 @@ class AutoShopApp:
             traceback.print_exc()
             messagebox.showerror("启动失败", f"错误：{e}")
             is_running = False
-            self.update_ui()  # 立即刷新UI以恢复按钮状态
+            self.update_ui()
 
     def stop_auto(self):
         global stop_flag, is_running
